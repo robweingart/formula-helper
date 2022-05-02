@@ -1,4 +1,5 @@
-import Control.Monad.Writer.Lazy
+import Control.Monad.Writer
+import Control.Monad.State
 import Data.Bifunctor
 import qualified Data.Map as M
 import Data.Maybe
@@ -187,7 +188,43 @@ tseitinPart subfs p@(Implies x y) = Iff (rep subfs p) (Implies (rep subfs x) (re
 tseitinPart subfs p@(Iff x y) = Iff (rep subfs p) (Iff (rep subfs x) (rep subfs y)) 
 
 rename :: Formula -> Formula
-rename = id -- TODO
+rename f = evalState (rename' M.empty f) M.empty
+
+type Counts = M.Map VarId Int
+
+rename' :: M.Map VarId VarId -> Formula -> State Counts Formula
+rename' _ FTrue = return FTrue
+rename' _ FFalse = return FFalse
+rename' bound (Pred p xs) = return $ Pred p (applyRename bound xs)
+rename' bound (Not x) = do
+  x' <- rename' bound x
+  return $ Not x'
+rename' bound (And x y) = renameBranch bound And x y
+rename' bound (Or x y) = renameBranch bound Or x y
+rename' bound (Implies x y) = renameBranch bound Implies x y
+rename' bound (Iff x y) = renameBranch bound Iff x y
+rename' bound (ForAll v x) = renameQuantifier bound ForAll v x
+rename' bound (Exists v x) = renameQuantifier bound Exists v x
+
+renameBranch :: M.Map VarId VarId -> (Formula -> Formula -> Formula) -> Formula -> Formula -> State Counts Formula
+renameBranch bound f x y = do
+  x' <- rename' bound x
+  y' <- rename' bound y
+  return $ f x' y'
+
+renameQuantifier :: M.Map VarId VarId -> (VarId -> Formula -> Formula) -> VarId -> Formula -> State Counts Formula
+renameQuantifier bound qf v x = do
+  uses <- get
+  let n = fromMaybe 0 (M.lookup v uses)
+  let n' = n + 1
+  put (M.insert v n' uses)
+  let v' = v ++ show n'
+  let bound' = M.insert v v' bound
+  x' <- rename' bound' x
+  return $ qf v' x'
+
+applyRename :: M.Map VarId VarId -> [VarId] -> [VarId]
+applyRename bound = map (\x -> fromMaybe x (M.lookup x bound))
 
 toPNF :: Formula -> Writer [Formula] Formula
 toPNF = toPNF' . rename
