@@ -1,3 +1,5 @@
+{-# LANGUAGE FlexibleContexts #-}
+
 import Control.Monad.Writer
 import Control.Monad.State
 import Data.Bifunctor
@@ -56,68 +58,76 @@ normalize (ForAll v x) = ForAll v (normalize x)
 normalize (Exists v x) = Exists v (normalize x)
 normalize x = x
 
-mapWorking :: (Formula -> Formula) -> Writer [Formula] Formula -> Writer [Formula] Formula
-mapWorking f = mapWriter (second (map f))
+mapWorking :: MonadWriter [Formula] m => (Formula -> Formula) -> m Formula -> m Formula
+mapWorking = censor . map
 
-withWorking1 :: (Formula -> Formula) -> (Formula -> Writer [Formula] Formula) -> Formula -> Writer [Formula] Formula
-withWorking1 f eval x = do
-  tell [f x]
-  withWorkingSkip1 f eval x
+work1 :: MonadWriter [Formula] m => (Formula -> Formula) -> (Formula -> m Formula) -> Formula -> m Formula
+work1 f eval x = do
+  step (f x)
+  wrap f (eval x)
 
-withWorkingSkip1 :: (Formula -> Formula) -> (Formula -> Writer [Formula] Formula) -> Formula -> Writer [Formula] Formula
-withWorkingSkip1 f eval x = do
-  ex <- mapWorking f (eval x)
+step :: MonadWriter [Formula] m => Formula -> m ()
+step x = tell [x]
+
+(<:>) :: MonadWriter [Formula] m => Formula -> m Formula -> m Formula
+(<:>) x y = do
+  tell [x]
+  y
+
+wrap :: MonadWriter [Formula] m => (Formula -> Formula) -> m Formula -> m Formula
+wrap f x = do
+  ex <- mapWorking f x
   return (f ex)
 
-withWorking2 :: (Formula -> Formula -> Formula) -> (Formula -> Writer [Formula] Formula) -> Formula -> Formula -> Writer [Formula] Formula
-withWorking2 f eval x y = do
-  tell [f x y]
-  withWorkingSkip2 f eval x y
+work2 :: MonadWriter [Formula] m => (Formula -> Formula -> Formula) -> (Formula -> m Formula) -> Formula -> Formula -> m Formula
+work2 f eval x y = do
+  step (f x y)
+  wrap2 f eval x y
 
-withWorkingSkip2 :: (Formula -> Formula -> Formula) -> (Formula -> Writer [Formula] Formula) -> Formula -> Formula -> Writer [Formula] Formula
-withWorkingSkip2 f eval x y = do
+wrap2 :: MonadWriter [Formula] m => (Formula -> Formula -> Formula) -> (Formula -> m Formula) -> Formula -> Formula -> m Formula
+wrap2 f eval x y = do
   ex <- mapWorking (`f` y) (eval x)
   ey <- mapWorking (f ex) (eval y)
   return (f ex ey)
 
 -- Removes Implies and Iff
-expandArrows :: Formula -> Writer [Formula] Formula
+expandArrows :: MonadWriter [Formula] m => Formula -> m Formula
 expandArrows p@(Implies x y) = do
   tell [p]
   expandArrows (Or (Not x) y)
 expandArrows p@(Iff x y) = do
   tell [p]
   expandArrows (And (Implies x y) (Implies y x))
-expandArrows (Not x) = withWorking1 Not expandArrows x
-expandArrows (And x y) = withWorking2 And expandArrows x y
-expandArrows (Or x y) = withWorking2 Or expandArrows x y
+expandArrows (Not x) = work1 Not expandArrows x
+expandArrows (And x y) = work2 And expandArrows x y
+expandArrows (Or x y) = work2 Or expandArrows x y
 expandArrows x = return x
 
 -- Input must be quantifier-free
 toNNF :: Formula -> Writer [Formula] Formula
-toNNF (Not (Not x)) = withWorking1 id toNNF x
-toNNF (Not (And x y)) = withWorking2 Or toNNF (Not x) (Not y)
-toNNF (Not (Or x y)) = withWorking2 And toNNF (Not x) (Not y)
-toNNF (Not p@(Implies _ _)) = withWorking1 Not expandArrows p >>= toNNF
-toNNF (Not p@(Iff _ _)) = withWorking1 Not expandArrows p >>= toNNF
-toNNF (And x y) = withWorkingSkip2 And toNNF x y
-toNNF (Or x y) = withWorkingSkip2 Or toNNF x y
+toNNF p@(Not (Not x)) = toNNF x
+toNNF (Not (And x y)) = work2 Or toNNF (Not x) (Not y)
+toNNF (Not (Or x y)) = work2 And toNNF (Not x) (Not y)
+toNNF (Not p@(Implies _ _)) = work1 Not expandArrows p >>= toNNF
+toNNF (Not p@(Iff _ _)) = work1 Not expandArrows p >>= toNNF
+toNNF (And x y) = wrap2 And toNNF x y
+toNNF (Or x y) = wrap2 Or toNNF x y
 toNNF p@(Implies _ _) = expandArrows p >>= toNNF
 toNNF p@(Iff _ _) = expandArrows p >>= toNNF
 toNNF x = return x
 
 -- Input must be in PNF
 toCNF :: Formula -> Writer [Formula] Formula
-toCNF (ForAll v x) = withWorking1 (ForAll v) toCNF x
-toCNF (Exists v x) = withWorking1 (Exists v) toCNF x
+toCNF (ForAll v x) = work1 (ForAll v) toCNF x
+toCNF (Exists v x) = work1 (Exists v) toCNF x
 toCNF p = toNNF p >>= toCNF'
 
 toCNF' :: Formula -> Writer [Formula] Formula
-toCNF' (Or (And x y) z) = withWorking2 And toCNF' (Or x z) (Or y z)
-toCNF' (Or x (And y z)) = withWorking2 And toCNF' (Or x y) (Or x z)
-toCNF' (Not x) = withWorkingSkip1 Not toCNF' x
-toCNF' (And x y) = withWorkingSkip2 And toCNF' x y
-toCNF' (Or x y) = withWorkingSkip2 Or toCNF' x y
+toCNF' (Or (And x y) z) = work2 And toCNF' (Or x z) (Or y z)
+toCNF' (Or x (And y z)) = work2 And toCNF' (Or x y) (Or x z)
+toCNF' (Not x) = wrap Not (toCNF' x)
+toCNF' (And x y) = wrap2 And toCNF' x y
+toCNF' (Or x y) = wrap2 Or toCNF' x y
 toCNF' x = return x
 
 
@@ -233,31 +243,65 @@ toPNF' :: Formula -> Writer [Formula] Formula
 toPNF' FTrue = return FTrue
 toPNF' FFalse = return FFalse
 toPNF' p@(Pred s xs) = return p
-toPNF' (Not (Not f)) = withWorking1 id toPNF' f
-toPNF' (Not f) = withWorking1 Not toPNF' f >>= toPNFStep
-toPNF' (And x y) = withWorking2 And toPNF' x y >>= toPNFStep
-toPNF' (Or x y) = withWorking2 Or toPNF' x y >>= toPNFStep
+toPNF' (Not (Not f)) = work1 id toPNF' f
+toPNF' (Not f) = work1 Not toPNF' f >>= toPNFStep
+toPNF' (And x y) = work2 And toPNF' x y >>= toPNFStep
+toPNF' (Or x y) = work2 Or toPNF' x y >>= toPNFStep
 toPNF' p@(Implies _ _) = expandArrows p >>= toPNF'
 toPNF' p@(Iff _ _) = expandArrows p >>= toPNF'
-toPNF' (ForAll v f) = withWorkingSkip1 (ForAll v) toPNF' f
-toPNF' (Exists v f) = withWorkingSkip1 (Exists v) toPNF' f
+toPNF' (ForAll v f) = wrap (ForAll v) (toPNF' f)
+toPNF' (Exists v f) = wrap (Exists v) (toPNF' f)
 
 -- Everything except the outer layer must already be in PNF
 toPNFStep :: Formula -> Writer [Formula] Formula
-toPNFStep (Not (ForAll p f)) = withWorking1 (Exists p) toPNF' (Not f)
-toPNFStep (Not (Exists p f)) = withWorking1 (ForAll p) toPNF' (Not f)
-toPNFStep (And (ForAll v x) y) = withWorking1 (ForAll v) toPNFStep (And x y)
-toPNFStep (And (Exists v x) y) = withWorking1 (Exists v) toPNFStep (And x y)
-toPNFStep (And x (ForAll v y)) = withWorking1 (ForAll v) toPNFStep (And x y)
-toPNFStep (And x (Exists v y)) = withWorking1 (Exists v) toPNFStep (And x y)
-toPNFStep (Or (ForAll v x) y) = withWorking1 (ForAll v) toPNFStep (Or x y)
-toPNFStep (Or (Exists v x) y) = withWorking1 (Exists v) toPNFStep (Or x y)
-toPNFStep (Or x (ForAll v y)) = withWorking1 (ForAll v) toPNFStep (Or x y)
-toPNFStep (Or x (Exists v y)) = withWorking1 (Exists v) toPNFStep (Or x y)
+toPNFStep (Not (ForAll p f)) = work1 (Exists p) toPNF' (Not f)
+toPNFStep (Not (Exists p f)) = work1 (ForAll p) toPNF' (Not f)
+toPNFStep (And (ForAll v x) y) = work1 (ForAll v) toPNFStep (And x y)
+toPNFStep (And (Exists v x) y) = work1 (Exists v) toPNFStep (And x y)
+toPNFStep (And x (ForAll v y)) = work1 (ForAll v) toPNFStep (And x y)
+toPNFStep (And x (Exists v y)) = work1 (Exists v) toPNFStep (And x y)
+toPNFStep (Or (ForAll v x) y) = work1 (ForAll v) toPNFStep (Or x y)
+toPNFStep (Or (Exists v x) y) = work1 (Exists v) toPNFStep (Or x y)
+toPNFStep (Or x (ForAll v y)) = work1 (ForAll v) toPNFStep (Or x y)
+toPNFStep (Or x (Exists v y)) = work1 (Exists v) toPNFStep (Or x y)
 toPNFStep f = return f
 
 toCPNF :: Formula -> Writer [Formula] Formula
 toCPNF f = toPNF f >>= toCNF
+
+skolemize :: Formula -> Writer [Formula] Formula
+skolemize f = evalStateT (skolemize' [] f) (M.empty, M.empty)
+
+type SkolemState = (M.Map Int Int, M.Map VarId VarId)
+
+skolemize' :: [VarId] -> Formula -> StateT SkolemState (Writer [Formula]) Formula
+skolemize' _ FTrue = return FTrue
+skolemize' _ FFalse = return FFalse
+skolemize' _ p@(Pred t as) = do
+  (_, renames) <- get
+  return $ Pred t (applyRename renames as)
+skolemize' vs (Not x) = wrap Not (skolemize' vs x)
+skolemize' vs (And x y) = skolemizeBranch vs And x y
+skolemize' vs (Or x y) = skolemizeBranch vs Or x y
+skolemize' vs (Implies x y) = skolemizeBranch vs Implies x y
+skolemize' vs (Iff x y) = skolemizeBranch vs Iff x y
+skolemize' vs (ForAll v x) = wrap (ForAll v) (skolemize' (v : vs) x)
+skolemize' vs (Exists v x) = do
+  (predNums, renames) <- get
+  let m = length vs
+  let n = fromMaybe 0 (M.lookup m predNums) + 1
+  let v' = skolemPred m n
+  skolemize' (v' : vs) x
+
+skolemPred :: Int -> Int -> VarId
+skolemPred m n = "skolem_" ++ show m ++ "ary_" ++ show n
+
+skolemizeBranch :: [VarId] -> (Formula -> Formula -> Formula) -> Formula -> Formula -> StateT SkolemState (Writer [Formula]) Formula
+skolemizeBranch xs f x y = do
+  x' <- skolemize' xs x
+  y' <- skolemize' xs y
+  return $ f x' y'
+
 
 printWorking :: Writer [Formula] Formula -> IO ()
 printWorking w = mapM_ print $ dedup (working ++ [res])
