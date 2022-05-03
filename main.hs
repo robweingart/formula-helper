@@ -9,10 +9,14 @@ import Data.List
 
 type VarId = String
 type PredId = String
+type FuncId = String
+
+data Val = Func VarId [Val]
+  deriving (Eq, Ord)
 
 data Formula = FTrue
   | FFalse
-  | Pred PredId [VarId]
+  | Pred PredId [Val]
   | Not Formula
   | And Formula Formula
   | Or Formula Formula
@@ -21,6 +25,10 @@ data Formula = FTrue
   | ForAll VarId Formula
   | Exists VarId Formula
   deriving (Eq, Ord)
+
+instance Show Val where
+  show (Func s []) = s
+  show (Func f xs) = f ++ "(" ++ intercalate ", " (map show xs) ++ ")"
 
 
 instance Show Formula where
@@ -31,7 +39,7 @@ showFormula :: Formula -> String
 showFormula FTrue = "1"
 showFormula FFalse = "0"
 showFormula (Pred p []) = p
-showFormula (Pred p xs) = p ++ "(" ++ intercalate ", " xs ++ ")"
+showFormula (Pred p xs) = p ++ "(" ++ intercalate ", " (map show xs) ++ ")"
 showFormula (Not x) = "¬" ++ showFormula x
 showFormula (And x y) = "(" ++ showNoBrackets (And x y) ++ ")"
 showFormula (Or x y) = "(" ++ showNoBrackets (Or x y) ++ ")"
@@ -233,8 +241,8 @@ renameQuantifier bound qf v x = do
   x' <- rename' bound' x
   return $ qf v' x'
 
-applyRename :: M.Map VarId VarId -> [VarId] -> [VarId]
-applyRename bound = map (\x -> fromMaybe x (M.lookup x bound))
+applyRename :: M.Map VarId VarId -> [Val] -> [Val]
+applyRename bound = map (\(Func x []) -> Func (fromMaybe x (M.lookup x bound)) [])
 
 toPNF :: Formula -> Writer [Formula] Formula
 toPNF = toPNF' . rename
@@ -270,38 +278,51 @@ toCPNF :: Formula -> Writer [Formula] Formula
 toCPNF f = toPNF f >>= toCNF
 
 skolemize :: Formula -> Writer [Formula] Formula
-skolemize f = evalStateT (skolemize' [] f) (M.empty, M.empty)
+skolemize f = do
+  f' <- toCPNF f
+  return $ evalState (skolemize' [] f') (M.empty, M.empty)
 
-type SkolemState = (M.Map Int Int, M.Map VarId VarId)
+type SkolemState = (M.Map Int Int, M.Map Val Val)
 
-skolemize' :: [VarId] -> Formula -> StateT SkolemState (Writer [Formula]) Formula
+skolemize' :: [Val] -> Formula -> State SkolemState Formula
 skolemize' _ FTrue = return FTrue
 skolemize' _ FFalse = return FFalse
-skolemize' _ p@(Pred t as) = do
+skolemize' vs p@(Pred _ _) = do
   (_, renames) <- get
-  return $ Pred t (applyRename renames as)
-skolemize' vs (Not x) = wrap Not (skolemize' vs x)
+  return $ skolemRename vs renames p
+skolemize' vs (Not x) = do
+  x' <- skolemize' vs x
+  return $ Not x'
 skolemize' vs (And x y) = skolemizeBranch vs And x y
 skolemize' vs (Or x y) = skolemizeBranch vs Or x y
 skolemize' vs (Implies x y) = skolemizeBranch vs Implies x y
 skolemize' vs (Iff x y) = skolemizeBranch vs Iff x y
-skolemize' vs (ForAll v x) = wrap (ForAll v) (skolemize' (v : vs) x)
+skolemize' vs (ForAll v x) = do
+  x' <- skolemize' (Func v [] : vs) x
+  return $ ForAll v x'
 skolemize' vs (Exists v x) = do
   (predNums, renames) <- get
   let m = length vs
   let n = fromMaybe 0 (M.lookup m predNums) + 1
-  let v' = skolemPred m n
-  skolemize' (v' : vs) x
+  let i = skolemId m n
+  let val = Func i (reverse vs)
+  put (M.insert m n predNums, M.insert (Func v []) val renames)
+  skolemize' vs x
 
-skolemPred :: Int -> Int -> VarId
-skolemPred m n = "skolem_" ++ show m ++ "ary_" ++ show n
+skolemId :: Int -> Int -> VarId
+skolemId m n = "skolem_" ++ show m ++ "ary_" ++ show n
 
-skolemizeBranch :: [VarId] -> (Formula -> Formula -> Formula) -> Formula -> Formula -> StateT SkolemState (Writer [Formula]) Formula
+skolemizeBranch :: [Val] -> (Formula -> Formula -> Formula) -> Formula -> Formula -> State SkolemState Formula
 skolemizeBranch xs f x y = do
   x' <- skolemize' xs x
   y' <- skolemize' xs y
   return $ f x' y'
 
+skolemRename :: [Val] -> M.Map Val Val -> Formula -> Formula
+skolemRename us renames (Pred t xs) = Pred t $ map (skolemRename' us renames) xs
+
+skolemRename' :: [Val] -> M.Map Val Val -> Val -> Val
+skolemRename' us renames val = fromMaybe val $ M.lookup val renames
 
 printWorking :: Writer [Formula] Formula -> IO ()
 printWorking w = mapM_ print $ dedup (working ++ [res])
@@ -314,3 +335,6 @@ dedup [x] = [x]
 dedup (x : y : ys)
   | x == y    = dedup (y : ys)
   | otherwise = x : dedup (y : ys)
+
+var :: String -> Val
+var s = Func s []
